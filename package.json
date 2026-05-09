@@ -1,0 +1,51 @@
+{
+	"name": "family-spark",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"scripts": {
+		"dev": "vite dev",
+		"dev:server": "scripts/dev-server.sh start",
+		"dev:restart": "scripts/dev-server.sh restart",
+		"dev:stop": "scripts/dev-server.sh stop",
+		"dev:logs": "scripts/dev-server.sh logs",
+		"build": "vite build",
+		"preview": "vite preview",
+		"deploy": "npm run build && wrangler deploy",
+		"deploy:worker": "wrangler deploy",
+		"secrets:cloudflare": "node scripts/sync-cloudflare-secrets.mjs",
+		"types:cloudflare": "wrangler types",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"lint": "prettier --check . && eslint .",
+		"format": "prettier --write ."
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^4.20260508.1",
+		"@eslint/compat": "^2.0.4",
+		"@eslint/js": "^10.0.1",
+		"@sveltejs/adapter-cloudflare": "^7.2.8",
+		"@sveltejs/kit": "^2.57.0",
+		"@sveltejs/vite-plugin-svelte": "^7.0.0",
+		"@types/node": "^24",
+		"eslint": "^10.2.0",
+		"eslint-config-prettier": "^10.1.8",
+		"eslint-plugin-svelte": "^3.17.0",
+		"globals": "^17.4.0",
+		"prettier": "^3.8.1",
+		"prettier-plugin-svelte": "^3.5.1",
+		"svelte": "^5.55.2",
+		"svelte-check": "^4.4.6",
+		"typescript": "^6.0.2",
+		"typescript-eslint": "^8.58.1",
+		"vite": "^8.0.7",
+		"wrangler": "^4.90.0"
+	},
+	"dependencies": {
+		"@ljoukov/llm": "^7.0.18",
+		"@lucide/svelte": "^1.14.0",
+		"jose": "^6.2.3",
+		"zod": "^4.4.3"
+	}
+}
