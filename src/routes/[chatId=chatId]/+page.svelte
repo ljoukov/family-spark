@@ -4,12 +4,21 @@
 	import { resolve } from '$app/paths';
 	import { onMount, tick, untrack } from 'svelte';
 	import ArrowUp from '@lucide/svelte/icons/arrow-up';
+	import ChevronDown from '@lucide/svelte/icons/chevron-down';
 	import LogOut from '@lucide/svelte/icons/log-out';
 	import RotateCcw from '@lucide/svelte/icons/rotate-cw';
+	import Settings from '@lucide/svelte/icons/settings';
 	import Sparkles from '@lucide/svelte/icons/sparkles';
 	import Square from '@lucide/svelte/icons/square';
+	import Users from '@lucide/svelte/icons/users';
 	import { createChatId } from '$lib/chat-ids';
-	import type { ActiveChatRun, ChatRealtimeEvent, StoredChatMessage } from '$lib/server/chat-types';
+	import type {
+		ActiveChatRun,
+		ChatRealtimeEvent,
+		ChatSnapshot,
+		StoredChatMessage
+	} from '$lib/server/chat-types';
+	import type { ChatActionCard } from '$lib/family-types';
 	import type { PageData } from './$types';
 
 	type ChatRole = 'user' | 'assistant';
@@ -17,9 +26,15 @@
 	type ChatStatus = 'streaming' | 'done' | 'error';
 	type Usage = {
 		promptTokens?: number;
+		promptTextTokens?: number;
+		promptImageTokens?: number;
+		cachedTokens?: number;
 		responseTokens?: number;
+		responseTextTokens?: number;
+		responseImageTokens?: number;
 		thinkingTokens?: number;
 		totalTokens?: number;
+		toolUsePromptTokens?: number;
 	};
 	type ChatMessage = {
 		id: string;
@@ -30,6 +45,7 @@
 		modelVersion?: string;
 		costUsd?: number;
 		usage?: Usage;
+		cards?: ChatActionCard[];
 	};
 
 	const MAX_COMPOSER_LINES = 12;
@@ -68,9 +84,23 @@
 	let composerRef = $state<HTMLDivElement | null>(null);
 	let textareaRef = $state<HTMLTextAreaElement | null>(null);
 	let postController = $state<AbortController | null>(null);
+	let menuOpen = $state(false);
+	let activeChildId = $state<string | null>(
+		untrack(() => data.familyContext.activeChild?.id ?? null)
+	);
+	let cardFeedback = $state<Record<string, string>>({});
 
 	const canSend = $derived(draft.trim().length > 0 && !sending);
 	const hasThread = $derived(messages.length > 0);
+	const isAdult = $derived(data.familyContext.canManageFamily);
+	const avatarLabel = $derived(
+		(data.user?.name || data.user?.email || 'F').slice(0, 1).toUpperCase()
+	);
+	const activeChild = $derived(data.familyContext.activeChild);
+	const children = $derived(data.familyContext.family.children);
+	const chatScopeLabel = $derived(
+		activeChild ? `${activeChild.displayName}, age ${activeChild.age}` : 'Family chat'
+	);
 
 	function updateMessage(id: string, update: Partial<ChatMessage>): void {
 		messages = messages.map((message) => (message.id === id ? { ...message, ...update } : message));
@@ -90,6 +120,22 @@
 		}
 	}
 
+	function ensureAssistantMessage(messageId: string): void {
+		if (messages.some((message) => message.id === messageId)) {
+			return;
+		}
+		messages = [
+			...messages,
+			{
+				id: messageId,
+				role: 'assistant',
+				text: '',
+				thoughts: '',
+				status: 'streaming'
+			}
+		];
+	}
+
 	function toChatMessage(message: StoredChatMessage): ChatMessage {
 		return {
 			id: message.id,
@@ -99,7 +145,8 @@
 			status: message.status,
 			modelVersion: message.modelVersion,
 			costUsd: message.costUsd,
-			usage: message.usage
+			usage: message.usage,
+			cards: message.cards
 		};
 	}
 
@@ -136,7 +183,8 @@
 	}
 
 	function resetConversation(): void {
-		void goto(resolve(`/${createChatId()}`));
+		const childQuery = activeChildId ? `?child=${encodeURIComponent(activeChildId)}` : '';
+		void goto(resolve(`/${createChatId()}${childQuery}`));
 	}
 
 	async function stopResponse(): Promise<void> {
@@ -144,7 +192,8 @@
 			return;
 		}
 		try {
-			await fetch(resolve(`/api/chat/${chatId}/stop`), { method: 'POST' });
+			const childQuery = activeChildId ? `?child=${encodeURIComponent(activeChildId)}` : '';
+			await fetch(resolve(`/api/chat/${chatId}/stop${childQuery}`), { method: 'POST' });
 		} catch (err) {
 			error = err instanceof Error ? err.message : 'Unable to stop the response.';
 		}
@@ -186,6 +235,9 @@
 		const parts: string[] = [];
 		if (typeof usage.promptTokens === 'number') {
 			parts.push(`${usage.promptTokens.toLocaleString()} in`);
+		}
+		if (typeof usage.cachedTokens === 'number' && usage.cachedTokens > 0) {
+			parts.push(`${usage.cachedTokens.toLocaleString()} cached`);
 		}
 		if (typeof usage.responseTokens === 'number') {
 			parts.push(`${usage.responseTokens.toLocaleString()} out`);
@@ -237,6 +289,7 @@
 			return;
 		}
 		if (event.type === 'delta') {
+			ensureAssistantMessage(event.messageId);
 			if (event.channel === 'thought') {
 				appendMessageThoughts(event.messageId, event.text);
 				if (phase !== 'responding') {
@@ -292,75 +345,12 @@
 	}
 
 	function connectChatEvents(targetChatId: string): () => void {
-		let closed = false;
-		let source: EventSource | null = null;
-		let socket: WebSocket | null = null;
-		let socketOpened = false;
-		let reconnectTimer: number | null = null;
-		const eventsUrl = resolve(`/api/chat/${targetChatId}/events`);
-
-		const openSse = () => {
-			if (closed || source) {
-				return;
-			}
-			source = connectEventSource(eventsUrl);
-		};
-
-		const scheduleReconnect = () => {
-			if (closed || reconnectTimer !== null) {
-				return;
-			}
-			reconnectTimer = window.setTimeout(() => {
-				reconnectTimer = null;
-				source?.close();
-				source = null;
-				socketOpened = false;
-				openSocket();
-			}, 1000);
-		};
-
-		function openSocket() {
-			if (closed) {
-				return;
-			}
-			const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-			socket = new WebSocket(`${protocol}//${location.host}${eventsUrl}`);
-			socket.onopen = () => {
-				socketOpened = true;
-			};
-			socket.onmessage = (event) => {
-				if (typeof event.data === 'string') {
-					handleRealtimePayload(event.data);
-				}
-			};
-			socket.onerror = () => {
-				if (!socketOpened) {
-					socket?.close();
-					openSse();
-				}
-			};
-			socket.onclose = () => {
-				socket = null;
-				if (closed) {
-					return;
-				}
-				if (!socketOpened) {
-					openSse();
-					return;
-				}
-				scheduleReconnect();
-			};
-		}
-
-		openSocket();
+		const childQuery = activeChildId ? `?child=${encodeURIComponent(activeChildId)}` : '';
+		const eventsUrl = resolve(`/api/chat/${targetChatId}/events${childQuery}`);
+		const source = connectEventSource(eventsUrl);
 
 		return () => {
-			closed = true;
-			if (reconnectTimer !== null) {
-				clearTimeout(reconnectTimer);
-			}
-			source?.close();
-			socket?.close();
+			source.close();
 		};
 	}
 
@@ -384,7 +374,7 @@
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				signal: controller.signal,
-				body: JSON.stringify({ text })
+				body: JSON.stringify({ text, activeChildId })
 			});
 			if (!response.ok) {
 				let message = `Request failed with status ${response.status}`;
@@ -395,6 +385,19 @@
 					// Keep status message.
 				}
 				throw new Error(message);
+			}
+			try {
+				const payload = (await response.clone().json()) as {
+					snapshot?: ChatSnapshot;
+					activeRun?: ActiveChatRun | null;
+				};
+				if (payload.snapshot) {
+					applyRealtimeEvent({ ...payload.snapshot, type: 'snapshot' });
+				} else if ('activeRun' in payload) {
+					setActiveRun(payload.activeRun ?? null);
+				}
+			} catch {
+				// Realtime streams update normal Durable Object responses.
 			}
 		} catch (err) {
 			if (err instanceof DOMException && err.name === 'AbortError') {
@@ -413,8 +416,88 @@
 		}
 	}
 
+	function updateCardStatus(
+		messageId: string,
+		cardId: string,
+		status: ChatActionCard['status']
+	): void {
+		messages = messages.map((message) => {
+			if (message.id !== messageId || !message.cards) {
+				return message;
+			}
+			return {
+				...message,
+				cards: message.cards.map((card) => (card.id === cardId ? { ...card, status } : card))
+			};
+		});
+	}
+
+	async function handleCardAction(
+		messageId: string,
+		card: ChatActionCard,
+		action: 'confirm' | 'cancel'
+	): Promise<void> {
+		if (card.kind === 'open_dashboard') {
+			await goto(resolve('/family'));
+			return;
+		}
+		if (action === 'cancel') {
+			updateCardStatus(messageId, card.id, 'cancelled');
+			cardFeedback = { ...cardFeedback, [card.id]: 'Cancelled.' };
+			return;
+		}
+
+		updateCardStatus(messageId, card.id, 'confirmed');
+		try {
+			const response = await fetch(resolve('/api/family/chat-action'), {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ action, card })
+			});
+			const payload = (await response.json()) as { message?: string };
+			if (!response.ok) {
+				throw new Error(payload.message ?? `Request failed with status ${response.status}`);
+			}
+			cardFeedback = { ...cardFeedback, [card.id]: payload.message ?? 'Done.' };
+		} catch (err) {
+			updateCardStatus(messageId, card.id, 'error');
+			cardFeedback = {
+				...cardFeedback,
+				[card.id]: err instanceof Error ? err.message : 'Could not complete this action.'
+			};
+		}
+	}
+
 	onMount(() => {
+		let lastTouchEnd = 0;
+		const preventGestureZoom = (event: Event) => {
+			event.preventDefault();
+		};
+		const preventMultitouchZoom = (event: TouchEvent) => {
+			if (event.touches.length > 1) {
+				event.preventDefault();
+			}
+		};
+		const preventDoubleTapZoom = (event: TouchEvent) => {
+			const now = Date.now();
+			if (now - lastTouchEnd < 300) {
+				event.preventDefault();
+			}
+			lastTouchEnd = now;
+		};
+
+		document.addEventListener('gesturestart', preventGestureZoom, { passive: false });
+		document.addEventListener('gesturechange', preventGestureZoom, { passive: false });
+		document.addEventListener('touchmove', preventMultitouchZoom, { passive: false });
+		document.addEventListener('touchend', preventDoubleTapZoom, { passive: false });
 		textareaRef?.focus();
+
+		return () => {
+			document.removeEventListener('gesturestart', preventGestureZoom);
+			document.removeEventListener('gesturechange', preventGestureZoom);
+			document.removeEventListener('touchmove', preventMultitouchZoom);
+			document.removeEventListener('touchend', preventDoubleTapZoom);
+		};
 	});
 
 	$effect(() => {
@@ -430,6 +513,8 @@
 		phase = phaseFromMessages(data.activeRun);
 		draft = '';
 		error = null;
+		activeChildId = data.familyContext.activeChild?.id ?? null;
+		menuOpen = false;
 		pendingScrollMessageId = null;
 		lastScrollMessageId = null;
 	});
@@ -509,20 +594,10 @@
 			<span class="brand-mark" aria-hidden="true"><Sparkles size={18} /></span>
 			<div>
 				<h1>Family Spark</h1>
-				<p>{data.chatModel} · thinking {data.thinkingLevel}</p>
+				<p>{chatScopeLabel} · {data.chatModel}</p>
 			</div>
 		</div>
 		<div class="header-actions">
-			{#if data.user}
-				<div class="user-pill" title={data.user.email}>
-					{#if data.user.photoUrl}
-						<img src={data.user.photoUrl} alt="" referrerpolicy="no-referrer" />
-					{:else}
-						<span>{data.user.email.slice(0, 1).toUpperCase()}</span>
-					{/if}
-					<span class="user-email">{data.user.email}</span>
-				</div>
-			{/if}
 			<button
 				class="icon-button"
 				type="button"
@@ -532,10 +607,47 @@
 			>
 				<RotateCcw size={18} />
 			</button>
-			<a class="logout-link" href={resolve('/auth/logout')} title="Sign out" aria-label="Sign out">
-				<LogOut size={17} />
-				<span>Sign out</span>
-			</a>
+			<div class="account-menu">
+				<button
+					class="avatar-button"
+					type="button"
+					title="Account menu"
+					aria-label="Account menu"
+					aria-expanded={menuOpen}
+					onclick={() => (menuOpen = !menuOpen)}
+				>
+					{#if data.user?.photoUrl}
+						<img src={data.user.photoUrl} alt="" referrerpolicy="no-referrer" />
+					{:else}
+						<span class="avatar-circle">{avatarLabel}</span>
+					{/if}
+					<ChevronDown size={15} />
+				</button>
+				{#if menuOpen}
+					<div class="menu-panel">
+						<p class="menu-email">{data.user?.email}</p>
+						{#if isAdult}
+							<a href={resolve('/family')}><Settings size={15} /> Parent dashboard</a>
+						{:else}
+							<a href={resolve('/family')}><Settings size={15} /> My profile</a>
+						{/if}
+						{#if isAdult && children.length > 0}
+							<div class="menu-section">
+								<span>Child profiles</span>
+								<a href={resolve(`/${chatId}`)}><Users size={15} /> Family chat</a>
+								{#each children as child (child.id)}
+									<a href={resolve(`/${chatId}?child=${encodeURIComponent(child.id)}`)}>
+										<span class="mini-avatar">{child.displayName.slice(0, 1).toUpperCase()}</span>
+										{child.displayName}
+									</a>
+								{/each}
+							</div>
+						{/if}
+						<a href={resolve('/auth/logout')} data-sveltekit-reload><LogOut size={15} /> Sign out</a
+						>
+					</div>
+				{/if}
+			</div>
 		</div>
 	</header>
 
@@ -607,6 +719,43 @@
 								</p>
 							{:else}
 								<p class="message-placeholder">...</p>
+							{/if}
+
+							{#if message.cards?.length}
+								<div class="action-cards">
+									{#each message.cards as card (card.id)}
+										<section class={`action-card status-${card.status}`} aria-label={card.title}>
+											<div>
+												<strong>{card.title}</strong>
+												<p>{card.body}</p>
+											</div>
+											{#if cardFeedback[card.id]}
+												<p class="card-feedback">{cardFeedback[card.id]}</p>
+											{/if}
+											<div class="card-actions">
+												{#if card.kind === 'open_dashboard'}
+													<a href={resolve('/family')}>Open dashboard</a>
+												{:else}
+													<button
+														type="button"
+														disabled={card.status !== 'pending'}
+														onclick={() => void handleCardAction(message.id, card, 'confirm')}
+													>
+														{card.confirmLabel ?? 'Confirm'}
+													</button>
+													<button
+														class="secondary"
+														type="button"
+														disabled={card.status !== 'pending'}
+														onclick={() => void handleCardAction(message.id, card, 'cancel')}
+													>
+														{card.cancelLabel ?? 'Cancel'}
+													</button>
+												{/if}
+											</div>
+										</section>
+									{/each}
+								</div>
 							{/if}
 
 							{#if message.role === 'assistant' && (message.modelVersion || tokenLabel || message.costUsd)}
@@ -694,11 +843,16 @@
 			14rem,
 			calc(var(--app-viewport-height, 100vh) - var(--composer-offset) - 8.5rem)
 		);
+		position: fixed;
+		inset: 0;
 		height: var(--app-viewport-height, 100vh);
 		min-height: var(--app-viewport-height, 100vh);
+		width: 100%;
 		display: grid;
 		grid-template-rows: auto minmax(0, 1fr) auto;
 		overflow: hidden;
+		overscroll-behavior: none;
+		touch-action: manipulation;
 		background:
 			linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(248, 250, 249, 0.96)),
 			radial-gradient(circle at 18% 12%, rgba(41, 151, 128, 0.12), transparent 30rem),
@@ -764,72 +918,95 @@
 		min-width: 0;
 	}
 
-	.user-pill {
-		display: flex;
-		align-items: center;
-		gap: 0.45rem;
-		min-width: 0;
-		max-width: min(20rem, 34vw);
-		border: 1px solid rgba(35, 45, 42, 0.1);
-		border-radius: 999px;
-		background: rgba(255, 255, 255, 0.62);
-		padding: 0.2rem 0.6rem 0.2rem 0.25rem;
-		color: rgba(20, 24, 23, 0.72);
-		font-size: 0.8rem;
+	.account-menu {
+		position: relative;
 	}
 
-	.user-pill img,
-	.user-pill > span:first-child {
-		width: 1.55rem;
-		height: 1.55rem;
+	.avatar-button {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+		min-height: 2.25rem;
+		border: 1px solid rgba(35, 45, 42, 0.12);
+		border-radius: 999px;
+		background: rgba(255, 255, 255, 0.78);
+		padding: 0.18rem 0.5rem 0.18rem 0.18rem;
+		color: #28322f;
+		cursor: pointer;
+	}
+
+	.avatar-button img,
+	.avatar-circle {
+		width: 1.85rem;
+		height: 1.85rem;
 		border-radius: 999px;
 		flex: 0 0 auto;
 	}
 
-	.user-pill img {
+	.avatar-button img {
 		display: block;
 		object-fit: cover;
 	}
 
-	.user-pill > span:first-child {
+	.avatar-circle,
+	.mini-avatar {
 		display: grid;
 		place-items: center;
-		background: #e7f2ef;
-		color: #183c34;
-		font-weight: 700;
+		background: #183c34;
+		color: #ffffff;
+		font-weight: 760;
 	}
 
-	.user-email {
-		min-width: 0;
+	.menu-panel {
+		position: absolute;
+		right: 0;
+		top: calc(100% + 0.5rem);
+		width: min(18rem, calc(100vw - 1.5rem));
+		border: 1px solid rgba(35, 45, 42, 0.12);
+		border-radius: 0.5rem;
+		background: #ffffff;
+		box-shadow: 0 24px 54px -38px rgba(28, 34, 31, 0.58);
+		padding: 0.45rem;
+	}
+
+	.menu-email,
+	.menu-section > span {
+		display: block;
+		padding: 0.55rem 0.6rem;
+		color: rgba(20, 24, 23, 0.52);
+		font-size: 0.76rem;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
 
-	.logout-link {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		gap: 0.35rem;
-		min-height: 2.25rem;
-		border: 1px solid rgba(35, 45, 42, 0.12);
-		border-radius: 0.55rem;
-		background: rgba(255, 255, 255, 0.72);
-		padding: 0 0.65rem;
-		color: rgba(20, 24, 23, 0.62);
-		font-size: 0.82rem;
-		text-decoration: none;
-		white-space: nowrap;
-		transition:
-			background 0.16s ease,
-			border-color 0.16s ease,
-			color 0.16s ease;
+	.menu-section {
+		margin: 0.25rem 0;
+		border-top: 1px solid rgba(35, 45, 42, 0.08);
+		border-bottom: 1px solid rgba(35, 45, 42, 0.08);
+		padding: 0.25rem 0;
 	}
 
-	.logout-link:hover {
-		background: #ffffff;
-		border-color: rgba(41, 151, 128, 0.34);
-		color: #183c34;
+	.menu-panel a {
+		display: flex;
+		align-items: center;
+		gap: 0.45rem;
+		border-radius: 0.4rem;
+		padding: 0.6rem;
+		color: #1c2825;
+		text-decoration: none;
+		font-size: 0.9rem;
+	}
+
+	.menu-panel a:hover {
+		background: #eef5f2;
+	}
+
+	.mini-avatar {
+		width: 1.45rem;
+		height: 1.45rem;
+		border-radius: 999px;
+		font-size: 0.7rem;
 	}
 
 	.icon-button,
@@ -864,6 +1041,9 @@
 		overflow-y: auto;
 		padding: clamp(1rem, 4vw, 2rem);
 		scrollbar-width: thin;
+		overscroll-behavior: contain;
+		-webkit-overflow-scrolling: touch;
+		touch-action: pan-y;
 	}
 
 	.chat-error {
@@ -1018,6 +1198,83 @@
 		color: rgba(20, 24, 23, 0.48);
 	}
 
+	.action-cards {
+		display: grid;
+		gap: 0.65rem;
+		margin-top: 0.85rem;
+	}
+
+	.action-card {
+		display: grid;
+		gap: 0.7rem;
+		border: 1px solid rgba(41, 151, 128, 0.18);
+		border-radius: 0.55rem;
+		background: #f7fbf9;
+		padding: 0.8rem;
+	}
+
+	.action-card strong {
+		display: block;
+		color: #13211d;
+		font-size: 0.96rem;
+	}
+
+	.action-card p {
+		margin-top: 0.25rem;
+		color: rgba(20, 24, 23, 0.66);
+		line-height: 1.45;
+		font-size: 0.9rem;
+	}
+
+	.action-card.status-confirmed {
+		border-color: rgba(41, 151, 128, 0.34);
+	}
+
+	.action-card.status-cancelled,
+	.action-card.status-error {
+		border-color: rgba(178, 63, 63, 0.22);
+		background: #fff8f6;
+	}
+
+	.card-feedback {
+		margin: 0;
+		font-weight: 650;
+	}
+
+	.card-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+	}
+
+	.card-actions button,
+	.card-actions a {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-height: 2.35rem;
+		border: 1px solid #183c34;
+		border-radius: 0.5rem;
+		background: #183c34;
+		color: #ffffff;
+		padding: 0 0.8rem;
+		text-decoration: none;
+		font: inherit;
+		font-weight: 700;
+		cursor: pointer;
+	}
+
+	.card-actions button.secondary {
+		background: #ffffff;
+		color: #25312e;
+		border-color: rgba(35, 45, 42, 0.14);
+	}
+
+	.card-actions button:disabled {
+		cursor: not-allowed;
+		opacity: 0.55;
+	}
+
 	.message-meta {
 		display: flex;
 		flex-wrap: wrap;
@@ -1033,11 +1290,13 @@
 	}
 
 	.composer-wrap {
-		position: sticky;
+		position: fixed;
+		left: 50%;
 		bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+		transform: translateX(-50%);
 		z-index: 4;
 		width: min(54rem, calc(100% - clamp(2rem, 8vw, 4rem)));
-		margin: 0 auto 1rem;
+		margin: 0;
 	}
 
 	.composer {
@@ -1064,6 +1323,9 @@
 		padding: 0.4rem 0.2rem;
 		line-height: 1.5rem;
 		outline: none;
+		overscroll-behavior: contain;
+		-webkit-overflow-scrolling: touch;
+		touch-action: pan-y;
 	}
 
 	textarea::placeholder {
@@ -1116,9 +1378,9 @@
 		}
 	}
 
-	@supports (height: 100svh) {
+	@supports (height: 100dvh) {
 		:global(:root) {
-			--app-viewport-height: 100svh;
+			--app-viewport-height: 100dvh;
 		}
 	}
 
@@ -1139,17 +1401,8 @@
 			gap: 0.4rem;
 		}
 
-		.user-pill {
-			display: none;
-		}
-
-		.logout-link {
-			width: 2.25rem;
-			padding: 0;
-		}
-
-		.logout-link span {
-			display: none;
+		.menu-panel {
+			right: -0.2rem;
 		}
 
 		.chat-scroll {
@@ -1164,7 +1417,6 @@
 		.composer-wrap {
 			width: calc(100% - 1rem);
 			bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
-			margin-bottom: 0.5rem;
 		}
 
 		.empty-state {

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { CHAT_THINKING_LEVEL, resolveChatModel, type FamilySparkChatModel } from './chat-model';
+import { chatActionCardSchema } from '$lib/family-types';
 
 export const MAX_HISTORY_MESSAGES = 32;
 export const MAX_MESSAGE_CHARS = 12_000;
@@ -25,18 +26,28 @@ export const SYSTEM_PROMPT = [
 	'Adapt to age and confidence without sounding childish. For ages roughly 8-12 use simpler language and concrete examples; for 13-18 raise precision, evidence, and transfer.',
 	'For debate, guide the learner through claim, reason, evidence, warrant, counterargument, response, and judgement while keeping the conversation natural.',
 	'For practical family planning requests, answer directly with simple actionable structure; when learning is involved, switch to guided construction.',
+	'Respect the learner account context you are given: age band, guardian relationship, supervision level, homework answer policy, and privacy policy.',
+	'For 8-12 learners, behave like a structured guided tutor sheet: short turns, concrete examples, no direct homework solving, and more parent-mediated boundaries.',
+	'For 13-15 learners, preserve a private learning space while keeping strong safety guardrails and summary-level parent progress signals.',
+	'For 16-17 learners, default toward autonomy, exam practice, and serious-risk escalation only.',
+	'Do not turn parent insight into surveillance. Parent-facing summaries should focus on progress, misconceptions, effort, confidence, answer-seeking patterns, suggested next activity, and serious safety alerts.',
+	'Separate parental control, parental insight, and safety escalation. Do not imply parents automatically see everything unless the learner account context says full chats are parent-visible.',
 	'End learning turns by making the learner produce something: a sentence, explanation, example, prediction, comparison, or next question.',
 	'Be warm, direct, and concise. Make difficult ideas feel alive, but do not over-explain.'
 ].join('\n');
 
-const usageSchema = z
-	.object({
-		promptTokens: z.number().optional(),
-		responseTokens: z.number().optional(),
-		thinkingTokens: z.number().optional(),
-		totalTokens: z.number().optional()
-	})
-	.strict();
+const usageSchema = z.object({
+	promptTokens: z.number().optional(),
+	promptTextTokens: z.number().optional(),
+	promptImageTokens: z.number().optional(),
+	cachedTokens: z.number().optional(),
+	responseTokens: z.number().optional(),
+	responseTextTokens: z.number().optional(),
+	responseImageTokens: z.number().optional(),
+	thinkingTokens: z.number().optional(),
+	totalTokens: z.number().optional(),
+	toolUsePromptTokens: z.number().optional()
+});
 
 export const storedChatMessageSchema = z
 	.object({
@@ -48,7 +59,8 @@ export const storedChatMessageSchema = z
 		createdAt: z.number().int().positive(),
 		modelVersion: z.string().optional(),
 		costUsd: z.number().optional(),
-		usage: usageSchema.optional()
+		usage: usageSchema.optional(),
+		cards: z.array(chatActionCardSchema).optional()
 	})
 	.strict();
 
@@ -66,7 +78,8 @@ export const activeChatRunSchema = z
 	.object({
 		id: z.string().min(1),
 		assistantMessageId: z.string().min(1),
-		startedAt: z.number().int().positive()
+		startedAt: z.number().int().positive(),
+		contextInstructions: z.string().optional()
 	})
 	.strict();
 
@@ -123,7 +136,8 @@ export function createStoredMessage(
 		createdAt: message.createdAt ?? Date.now(),
 		modelVersion: message.modelVersion,
 		costUsd: message.costUsd,
-		usage: message.usage
+		usage: message.usage,
+		cards: message.cards
 	});
 }
 

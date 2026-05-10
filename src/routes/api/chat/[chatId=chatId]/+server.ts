@@ -1,5 +1,19 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
-import { fetchChatRoom } from '$lib/server/chat-do-client';
+import { fetchChatRoom, mutableChatResponse } from '$lib/server/chat-do-client';
+import { createFamilyChatActionCard } from '$lib/server/family-chat-actions';
+import {
+	createFamilyChatInstructions,
+	loadFamilySessionForUser,
+	resolveFamilyChatActor
+} from '$lib/server/family-session';
+import { z } from 'zod';
+
+const chatPostBodySchema = z
+	.object({
+		text: z.string(),
+		activeChildId: z.string().nullable().optional()
+	})
+	.strict();
 
 export const POST: RequestHandler = async ({ request, locals, params, platform }) => {
 	if (!locals.user) {
@@ -9,17 +23,43 @@ export const POST: RequestHandler = async ({ request, locals, params, platform }
 		return json({ error: 'invalid_chat_id', message: 'Invalid chat id.' }, { status: 400 });
 	}
 
-	const body = await request.text();
+	let body: z.infer<typeof chatPostBodySchema>;
+	try {
+		body = chatPostBodySchema.parse(await request.json());
+	} catch {
+		return json({ error: 'invalid_json', message: 'Request body must be JSON.' }, { status: 400 });
+	}
+
+	const familySession = await loadFamilySessionForUser(platform?.env, locals.user);
+	const actor = resolveFamilyChatActor({
+		session: familySession,
+		user: locals.user,
+		requestedChildId: body.activeChildId ?? null
+	});
+	const card = createFamilyChatActionCard({ text: body.text, session: familySession });
+	const chatBody = {
+		text: body.text,
+		contextInstructions: createFamilyChatInstructions({ session: familySession, actor }),
+		...(card
+			? {
+					assistantText:
+						card.kind === 'open_dashboard'
+							? 'Here is the parent dashboard entry point.'
+							: 'I can prepare that family account change. Please confirm it first.',
+					cards: [card]
+				}
+			: {})
+	};
 	const response = await fetchChatRoom({
 		platformEnv: platform?.env,
-		userId: locals.user.uid,
+		userId: actor.ownerId,
 		chatId: params.chatId,
 		path: '/message',
 		method: 'POST',
 		headers: {
-			'content-type': request.headers.get('content-type') ?? 'application/json'
+			'content-type': 'application/json'
 		},
-		body
+		body: JSON.stringify(chatBody)
 	});
 
 	if (!response) {
@@ -28,5 +68,5 @@ export const POST: RequestHandler = async ({ request, locals, params, platform }
 			{ status: 503 }
 		);
 	}
-	return response;
+	return mutableChatResponse(response);
 };

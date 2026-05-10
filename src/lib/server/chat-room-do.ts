@@ -1,6 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import { streamText, type LlmInputMessage, type LlmUsageTokens } from '@ljoukov/llm';
+import { z } from 'zod';
 import { isChatId } from '../chat-ids';
+import { chatActionCardSchema } from '$lib/family-types';
 import {
 	CHAT_ID_HEADER,
 	CHAT_USER_ID_HEADER,
@@ -26,6 +28,15 @@ const textEncoder = new TextEncoder();
 
 const LLM_ENV_KEYS = ['OPENAI_API_KEY'] as const;
 
+const postMessageBodySchema = z
+	.object({
+		text: z.string(),
+		contextInstructions: z.string().optional(),
+		assistantText: z.string().optional(),
+		cards: z.array(chatActionCardSchema).optional()
+	})
+	.strict();
+
 type ChatRoomEnv = Record<string, unknown>;
 
 type SseClient = {
@@ -44,6 +55,19 @@ function serializeError(error: unknown): string {
 		return error.message;
 	}
 	return 'The chat request failed.';
+}
+
+function errorForLog(error: unknown): Record<string, unknown> {
+	if (error instanceof Error) {
+		return {
+			name: error.name,
+			message: error.message,
+			stack: error.stack
+		};
+	}
+	return {
+		message: String(error)
+	};
 }
 
 function installLlmProcessEnv(platformEnv: ChatRoomEnv): void {
@@ -93,13 +117,30 @@ export class ChatRoomDurableObject extends DurableObject<ChatRoomEnv> {
 
 	constructor(ctx: DurableObjectState, env: ChatRoomEnv) {
 		super(ctx, env);
-		this.ready = this.loadState();
+		this.ready = this.ctx.blockConcurrencyWhile(() => this.loadState());
 	}
 
 	private async loadState(): Promise<void> {
 		const stored = await this.ctx.storage.get(STORAGE_KEY);
 		if (stored) {
-			this.state = durableChatStateSchema.parse(stored);
+			const parsed = durableChatStateSchema.safeParse(stored);
+			if (!parsed.success) {
+				console.error('Stored chat state could not be parsed.', {
+					issues: parsed.error.issues.map((issue) => ({
+						path: issue.path.join('.'),
+						code: issue.code,
+						message: issue.message
+					}))
+				});
+				try {
+					await this.ctx.storage.put(`${STORAGE_KEY}:invalid:${Date.now()}`, stored);
+					await this.ctx.storage.delete(STORAGE_KEY);
+				} catch (error) {
+					console.error('Invalid chat state could not be moved aside.', errorForLog(error));
+				}
+				return;
+			}
+			this.state = parsed.data;
 			if (this.state.activeRun) {
 				this.recoverInterruptedRun(this.state);
 			}
@@ -345,11 +386,15 @@ export class ChatRoomDurableObject extends DurableObject<ChatRoomEnv> {
 		const controller = new AbortController();
 		this.activeAbortController = controller;
 		const chatModel = resolveChatModel(this.env);
+		const instructions = activeRun.contextInstructions
+			? `${SYSTEM_PROMPT}\n\n${activeRun.contextInstructions}`
+			: SYSTEM_PROMPT;
+		const input = this.requestInputMessages(state, activeRun.assistantMessageId);
 		const call = streamText({
 			model: chatModel,
 			thinkingLevel: CHAT_THINKING_LEVEL,
-			instructions: SYSTEM_PROMPT,
-			input: this.requestInputMessages(state, activeRun.assistantMessageId),
+			instructions,
+			input,
 			signal: controller.signal
 		});
 		controller.signal.addEventListener('abort', () => call.abort(), { once: true });
@@ -483,9 +528,9 @@ export class ChatRoomDurableObject extends DurableObject<ChatRoomEnv> {
 			);
 		}
 
-		let body: { text?: unknown };
+		let body: z.infer<typeof postMessageBodySchema>;
 		try {
-			body = (await request.json()) as { text?: unknown };
+			body = postMessageBodySchema.parse(await request.json());
 		} catch {
 			return jsonResponse(
 				{ error: 'invalid_json', message: 'Request body must be JSON.' },
@@ -502,6 +547,27 @@ export class ChatRoomDurableObject extends DurableObject<ChatRoomEnv> {
 		}
 
 		const userMessage = createStoredMessage({ role: 'user', text });
+		const cards = body.cards ?? [];
+		if (cards.length > 0) {
+			const assistantMessage = createStoredMessage({
+				role: 'assistant',
+				text:
+					body.assistantText?.trim() ||
+					'Please confirm this family account change before I do anything.',
+				cards,
+				status: 'done'
+			});
+			this.appendMessage(state, userMessage);
+			this.appendMessage(state, assistantMessage);
+			this.markDirty();
+			this.broadcast({ type: 'message_added', message: userMessage, activeRun: null });
+			this.broadcast({ type: 'message_added', message: assistantMessage, activeRun: null });
+			return jsonResponse(
+				{ ok: true, activeRun: null, snapshot: chatSnapshotFromState(state, this.env) },
+				{ status: 202 }
+			);
+		}
+
 		const assistantMessage = createStoredMessage({
 			role: 'assistant',
 			text: '',
@@ -511,7 +577,8 @@ export class ChatRoomDurableObject extends DurableObject<ChatRoomEnv> {
 		const activeRun: ActiveChatRun = {
 			id: createRunId(),
 			assistantMessageId: assistantMessage.id,
-			startedAt: Date.now()
+			startedAt: Date.now(),
+			contextInstructions: body.contextInstructions
 		};
 
 		this.appendMessage(state, userMessage);
@@ -527,7 +594,10 @@ export class ChatRoomDurableObject extends DurableObject<ChatRoomEnv> {
 		this.ctx.waitUntil(run);
 		void run;
 
-		return jsonResponse({ ok: true, activeRun }, { status: 202 });
+		return jsonResponse(
+			{ ok: true, activeRun, snapshot: chatSnapshotFromState(state, this.env) },
+			{ status: 202 }
+		);
 	}
 
 	private async stopRun(request: Request): Promise<Response> {
@@ -550,30 +620,43 @@ export class ChatRoomDurableObject extends DurableObject<ChatRoomEnv> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		const authError = this.requireUser(request);
-		if (authError) {
-			return authError;
-		}
-
 		const url = new URL(request.url);
-		if (request.method === 'GET' && url.pathname === '/events') {
-			return await this.openEvents(request);
-		}
-		if (request.method === 'GET' && url.pathname === '/state') {
-			const state = await this.getState(request);
-			return jsonResponse(chatSnapshotFromState(state, this.env));
-		}
-		if (request.method === 'POST' && url.pathname === '/message') {
-			return await this.postMessage(request);
-		}
-		if (request.method === 'POST' && url.pathname === '/stop') {
-			return await this.stopRun(request);
-		}
+		try {
+			const authError = this.requireUser(request);
+			if (authError) {
+				return authError;
+			}
 
-		return jsonResponse(
-			{ error: 'not_found', message: 'Unknown chat room route.' },
-			{ status: 404 }
-		);
+			if (request.method === 'GET' && url.pathname === '/events') {
+				return await this.openEvents(request);
+			}
+			if (request.method === 'GET' && url.pathname === '/state') {
+				const state = await this.getState(request);
+				return jsonResponse(chatSnapshotFromState(state, this.env));
+			}
+			if (request.method === 'POST' && url.pathname === '/message') {
+				return await this.postMessage(request);
+			}
+			if (request.method === 'POST' && url.pathname === '/stop') {
+				return await this.stopRun(request);
+			}
+
+			return jsonResponse(
+				{ error: 'not_found', message: 'Unknown chat room route.' },
+				{ status: 404 }
+			);
+		} catch (error) {
+			console.error('Chat room Durable Object request failed.', {
+				method: request.method,
+				pathname: url.pathname,
+				chatId: request.headers.get(CHAT_ID_HEADER),
+				error: errorForLog(error)
+			});
+			return jsonResponse(
+				{ error: 'chat_room_failed', message: 'Chat storage failed.' },
+				{ status: 500 }
+			);
+		}
 	}
 
 	async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {

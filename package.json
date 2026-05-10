@@ -13,6 +13,7 @@
 		"preview": "vite preview",
 		"deploy": "npm run build && wrangler deploy",
 		"deploy:worker": "wrangler deploy",
+		"test:prompt": "node scripts/test-system-prompt.mjs",
 		"secrets:cloudflare": "node scripts/sync-cloudflare-secrets.mjs",
 		"types:cloudflare": "wrangler types",
 		"prepare": "svelte-kit sync || echo ''",

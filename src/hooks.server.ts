@@ -1,4 +1,4 @@
-import { readAuthFromCookies } from '$lib/server/auth/session';
+import { readAuthFromCookies, readLearnerAuthFromCookies } from '$lib/server/auth/session';
 import type { Handle } from '@sveltejs/kit';
 
 const PUBLIC_PATHS = new Set(['/robots.txt']);
@@ -6,6 +6,7 @@ const PUBLIC_PATHS = new Set(['/robots.txt']);
 function isPublicPath(pathname: string): boolean {
 	return (
 		pathname.startsWith('/auth/') ||
+		pathname === '/child-login' ||
 		pathname === '/login-with-email' ||
 		pathname.startsWith('/_app/') ||
 		pathname.startsWith('/favicon') ||
@@ -28,7 +29,12 @@ export const handle: Handle = async ({ event, resolve }) => {
 
 	const authResult = await readAuthFromCookies(event.cookies, event.platform?.env);
 	if (authResult.status === 'signed_out') {
-		return redirectToLogin(event.url);
+		const learnerUser = await readLearnerAuthFromCookies(event.cookies, event.platform?.env);
+		if (!learnerUser) {
+			return redirectToLogin(event.url);
+		}
+		event.locals.user = learnerUser;
+		return await resolve(event);
 	}
 
 	event.locals.user = authResult.user;

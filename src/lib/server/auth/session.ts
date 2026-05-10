@@ -9,6 +9,7 @@ export const AUTH_SESSION_ID_COOKIE_NAME = 'familySparkAuthSession';
 export const AUTH_NEXT_COOKIE_NAME = 'familySparkAuthNext';
 
 const AUTH_USER_COOKIE_NAME = 'familySparkAuth';
+const LEARNER_USER_COOKIE_NAME = 'familySparkLearner';
 const AUTH_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 
@@ -25,6 +26,16 @@ const authSessionSchema = z.object({
 export type AuthSession = z.infer<typeof authSessionSchema>;
 
 export type AuthUser = Pick<AuthSession, 'uid' | 'email' | 'name' | 'photoUrl'>;
+
+const learnerSessionSchema = z.object({
+	familyId: z.string().min(1),
+	childId: z.string().min(1),
+	displayName: z.string().min(1),
+	deviceId: z.string().min(1),
+	expiresAtMs: z.number().int().positive()
+});
+
+export type LearnerSession = z.infer<typeof learnerSessionSchema>;
 
 export type AuthResult =
 	| { status: 'ok'; session: AuthSession; user: AuthUser }
@@ -102,6 +113,40 @@ export function clearAuthSessionCookie(cookies: Cookies): void {
 		secure: dev ? false : true,
 		expires: new Date(0)
 	});
+}
+
+export async function setLearnerSessionCookie(
+	cookies: Cookies,
+	session: LearnerSession,
+	secret: string
+) {
+	cookies.set(LEARNER_USER_COOKIE_NAME, await sealJson(session, secret), {
+		path: '/',
+		httpOnly: true,
+		sameSite: 'lax',
+		secure: dev ? false : true,
+		expires: new Date(Date.now() + AUTH_COOKIE_MAX_AGE_SECONDS * 1000),
+		maxAge: AUTH_COOKIE_MAX_AGE_SECONDS
+	});
+}
+
+export function clearLearnerSessionCookie(cookies: Cookies): void {
+	cookies.set(LEARNER_USER_COOKIE_NAME, '', {
+		path: '/',
+		httpOnly: true,
+		sameSite: 'lax',
+		secure: dev ? false : true,
+		expires: new Date(0)
+	});
+}
+
+export function createLearnerAuthUser(session: LearnerSession): AuthUser {
+	return {
+		uid: `learner:${session.familyId}:${session.childId}`,
+		email: `learner-${session.childId}@family-spark.local`,
+		name: session.displayName,
+		photoUrl: null
+	};
 }
 
 export function createAuthSession({
@@ -193,5 +238,29 @@ export async function readAuthFromCookies(
 		console.warn('Auth session cookie could not be read.', error);
 		clearAuthSessionCookie(cookies);
 		return { status: 'signed_out' };
+	}
+}
+
+export async function readLearnerAuthFromCookies(
+	cookies: Cookies,
+	platformEnv?: unknown
+): Promise<AuthUser | null> {
+	const sealed = cookies.get(LEARNER_USER_COOKIE_NAME);
+	if (!sealed) {
+		return null;
+	}
+
+	const env = getRuntimeEnv(platformEnv);
+	try {
+		const session = await openJson(sealed, env.authCookieSecret, learnerSessionSchema);
+		if (session.expiresAtMs < Date.now()) {
+			clearLearnerSessionCookie(cookies);
+			return null;
+		}
+		return createLearnerAuthUser(session);
+	} catch (error) {
+		console.warn('Learner session cookie could not be read.', error);
+		clearLearnerSessionCookie(cookies);
+		return null;
 	}
 }

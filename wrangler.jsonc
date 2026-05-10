@@ -20,6 +20,10 @@
 			{
 				"name": "CHAT_ROOMS",
 				"class_name": "ChatRoomDurableObject"
+			},
+			{
+				"name": "FAMILY_ACCOUNTS",
+				"class_name": "FamilyAccountDurableObject"
 			}
 		]
 	},
@@ -27,6 +31,10 @@
 		{
 			"tag": "v1",
 			"new_sqlite_classes": ["ChatRoomDurableObject"]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": ["FamilyAccountDurableObject"]
 		}
 	]
 }

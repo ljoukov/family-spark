@@ -15,6 +15,9 @@ declare global {
 		interface Platform {
 			env?: Record<string, unknown> & {
 				CHAT_ROOMS?: DurableObjectNamespace;
+				FAMILY_ACCOUNTS?: DurableObjectNamespace;
+				FAMILY_SPARK_DO_GATEWAY_ORIGIN?: string;
+				FAMILY_SPARK_DO_GATEWAY_TOKEN?: string;
 			};
 			context?: ExecutionContext;
 		}

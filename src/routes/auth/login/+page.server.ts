@@ -1,7 +1,8 @@
 import {
 	clearAuthNextCookie,
 	clearAuthSessionCookie,
-	clearAuthSessionIdCookie
+	clearAuthSessionIdCookie,
+	clearLearnerSessionCookie
 } from '$lib/server/auth/session';
 import type { PageServerLoad } from './$types';
 
@@ -16,6 +17,7 @@ export const load: PageServerLoad = async ({ cookies, url }) => {
 	clearAuthNextCookie(cookies);
 	clearAuthSessionIdCookie(cookies);
 	clearAuthSessionCookie(cookies);
+	clearLearnerSessionCookie(cookies);
 	return {
 		next: safeNext(url.searchParams.get('next'))
 	};

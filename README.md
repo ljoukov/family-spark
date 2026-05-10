@@ -46,6 +46,11 @@ scripts/dev-server.sh start
 Main auth is Google through `/auth/start`. The hidden email-password test route
 is `/login-with-email`.
 
+Child access is parent-owned by default: adults create learner profiles in
+`/family`, set a PIN, and children use `/child-login` with family code + profile
+name + PIN. Optional child email/password accounts are only a compatibility
+path for older teen or test flows.
+
 ## Validate
 
 ```sh

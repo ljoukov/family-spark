@@ -1,7 +1,8 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
-import { fetchChatRoom } from '$lib/server/chat-do-client';
+import { fetchChatRoom, mutableChatResponse } from '$lib/server/chat-do-client';
+import { loadFamilySessionForUser, resolveFamilyChatActor } from '$lib/server/family-session';
 
-export const GET: RequestHandler = async ({ request, locals, params, platform }) => {
+export const GET: RequestHandler = async ({ request, locals, params, platform, url }) => {
 	if (!locals.user) {
 		return json({ error: 'signed_out', message: 'Sign in before chatting.' }, { status: 401 });
 	}
@@ -9,9 +10,15 @@ export const GET: RequestHandler = async ({ request, locals, params, platform })
 		return json({ error: 'invalid_chat_id', message: 'Invalid chat id.' }, { status: 400 });
 	}
 
+	const familySession = await loadFamilySessionForUser(platform?.env, locals.user);
+	const actor = resolveFamilyChatActor({
+		session: familySession,
+		user: locals.user,
+		requestedChildId: url.searchParams.get('child')
+	});
 	const response = await fetchChatRoom({
 		platformEnv: platform?.env,
-		userId: locals.user.uid,
+		userId: actor.ownerId,
 		chatId: params.chatId,
 		path: '/events',
 		request
@@ -23,5 +30,5 @@ export const GET: RequestHandler = async ({ request, locals, params, platform })
 			{ status: 503 }
 		);
 	}
-	return response;
+	return mutableChatResponse(response);
 };

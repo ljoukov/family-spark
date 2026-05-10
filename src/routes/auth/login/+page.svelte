@@ -25,9 +25,12 @@
 				receives a secure session cookie.
 			</p>
 		</div>
-		<a class="login-button" href={loginHref}>
+		<a class="login-button" href={loginHref} data-sveltekit-reload>
 			<span class="google-g" aria-hidden="true">G</span>
 			<span>Continue with Google</span>
+		</a>
+		<a class="child-link" href={resolve(`/child-login?next=${encodeURIComponent(data.next)}`)}>
+			Child profile login
 		</a>
 	</section>
 </main>
@@ -132,6 +135,15 @@
 	.login-button:hover {
 		background: #245a4f;
 		transform: translateY(-1px);
+	}
+
+	.child-link {
+		margin-top: 0.8rem;
+		display: flex;
+		justify-content: center;
+		color: #183c34;
+		font-weight: 700;
+		text-decoration: none;
 	}
 
 	.google-g {
